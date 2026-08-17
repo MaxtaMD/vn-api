@@ -154,30 +154,36 @@ def build_proxy_url(worker_base: str, raw_url: str, referer: str) -> str:
     return f"{worker_base.rstrip('/')}/proxy?token={quote(token, safe='')}"
 
 
-def build_direct_proxy_url(worker_base: str, raw_url: str) -> str:
-    """For direct file links (.mkv/.mp4/...) we don't need referer/origin
-    spoofing (unlike HLS/DASH manifest segments, these direct links aren't
-    typically referer-gated), so we don't store a `ref` in the token at
-    all and the proxy sends no Referer/Origin upstream for these — just a
-    plain byte-streaming proxy through /proxy with an encrypted, expiring
-    token hiding the real URL."""
-    token = create_proxy_token(raw_url, None)
-    return f"{worker_base.rstrip('/')}/proxy?token={quote(token, safe='')}"
-
-
 def attach_proxy_urls(payload: dict, worker_base: str) -> dict:
     url = payload.get("url")
     headers = payload.get("headers") or {}
     referer = headers.get("Referer", VIDNEST_REFERER)
 
-    if not url:
-        payload["proxy_url"] = None
-    elif _looks_like_manifest(url):
+    if url and _looks_like_manifest(url):
         payload["proxy_url"] = build_proxy_url(worker_base, url, referer)
     else:
-        # Direct file (.mkv/.mp4/.webm/...) — token-protected, but no
-        # referer/origin needed for these.
-        payload["proxy_url"] = build_direct_proxy_url(worker_base, url)
+        payload["proxy_url"] = None
+
+    # Subtitle tracks (hianime's own 'tracks', or the vdrk CDN entries added
+    # for movie/tv) carry a raw upstream URL the same way the main stream
+    # does — proxy each one behind its own encrypted token so the real
+    # subtitle host/path never appears in the API response, same reasoning
+    # as the video url. cache.vdrk.site entries in particular have no
+    # backend-specific Referer requirement, but proxying them anyway keeps
+    # the response consistent (nothing exposes a raw third-party URL) and
+    # costs nothing — /proxy already handles the "subtitle" content-kind
+    # case (see kind == "subtitle" below) regardless of which CDN it came
+    # from.
+    subtitles = payload.get("subtitles")
+    if isinstance(subtitles, list):
+        for track in subtitles:
+            if not isinstance(track, dict):
+                continue
+            sub_url = track.get("url")
+            if sub_url:
+                track["proxy_url"] = build_proxy_url(worker_base, sub_url, referer)
+            else:
+                track["proxy_url"] = None
 
 
 def _https_worker_base(request: Request) -> str:
@@ -310,14 +316,11 @@ def _proxy_upstream_headers(referer: str, range_header: Optional[str]) -> dict:
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    # referer is only ever non-empty here for manifest/segment URLs, whose
-    # tokens carry a `ref`. Direct-file tokens (see build_direct_proxy_url)
-    # never store a ref, so this naturally stays empty for them — no
-    # Referer/Origin sent upstream, since those links aren't referer-gated.
-    if referer:
-        headers["Referer"] = referer
+    ref = referer or VIDNEST_REFERER
+    if ref:
+        headers["Referer"] = ref
         try:
-            parsed = urlsplit(referer)
+            parsed = urlsplit(ref)
             headers["Origin"] = f"{parsed.scheme}://{parsed.netloc}"
         except Exception:
             pass
@@ -514,12 +517,7 @@ def proxy(request: Request, token: str = Query(...)):
     arrival. Also does everything universal-proxy's Railway service does:
     DASH (.mpd) rewriting, a byte-capped in-memory segment/manifest cache,
     and background prefetching of upcoming segments — all folded into
-    VidNest's own inbuilt proxy instead of a separate deployment.
-
-    For direct files (.mkv/.mp4/...) the token carries no `ref` (see
-    build_direct_proxy_url), so no Referer/Origin gets sent upstream —
-    those links don't need it. Manifest/segment tokens do carry a `ref`
-    and get it forwarded as before."""
+    VidNest's own inbuilt proxy instead of a separate deployment."""
     decoded = verify_proxy_token(token)
     if decoded is None:
         raise HTTPException(status_code=403, detail="Invalid or expired token")
