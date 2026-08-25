@@ -19,6 +19,9 @@ import ssl
 VIDNEST_ALPHABET = "RB0fpH8ZEyVLkv7c2i6MAJ5u3IKFDxlS1NTsnGaqmXYdUrtzjwObCgQP94hoeW+/="
 
 # Backend configurations
+# One canonical entry per upstream backend path.
+# Keep this list unique by `path` so aliases/casing variants cannot cause
+# duplicate upstream requests or duplicate result rows.
 BACKENDS = [
     {'name': 'MoviesAPI', 'path': 'moviesapi'},
     {'name': 'HollyMovieHD', 'path': 'hollymoviehd'},
@@ -28,10 +31,8 @@ BACKENDS = [
     {'name': 'MovieBox', 'path': 'moviebox'},
     {'name': 'Videasy', 'path': 'videasy'},
     {'name': 'NextgenCloudFabric', 'path': 'nextgencloudfabric'},
-    {'name': 'MoviesApi', 'path': 'moviesapi'},
     {'name': 'Vidxyz', 'path': 'vidxyz'},
     {'name': 'Vidzee', 'path': 'vidzee'},
-    {'name': 'Vidlink', 'path': 'vidlink'}
 ]
 
 USER_AGENTS = {
@@ -273,7 +274,19 @@ class VidNestResolver:
         threads = []
         result_queue = Queue()
 
+        # Defensive config de-duplication. Even if a future edit accidentally
+        # adds another alias such as MoviesApi/moviesapi or Vidlink/vidlink,
+        # only one upstream request is fired for that canonical path.
+        unique_backends = []
+        seen_paths = set()
         for backend in BACKENDS:
+            canonical_path = str(backend.get('path', '')).strip().lower()
+            if not canonical_path or canonical_path in seen_paths:
+                continue
+            seen_paths.add(canonical_path)
+            unique_backends.append(backend)
+
+        for backend in unique_backends:
             thread = threading.Thread(
                 target=self._try_backend_thread,
                 args=(tmdb_id, backend, media_type, season, episode, result_queue)
@@ -287,7 +300,32 @@ class VidNestResolver:
         while not result_queue.empty():
             results.append(result_queue.get())
 
-        return results
+        # Defensive result de-duplication by backend path.
+        # Prefer a successful result; otherwise keep the faster attempt.
+        deduped = {}
+        order = []
+        for result in results:
+            key = str(result.get('path') or result.get('backend') or '').strip().lower()
+            if not key:
+                key = f"__row_{len(order)}"
+
+            if key not in deduped:
+                deduped[key] = result
+                order.append(key)
+                continue
+
+            current = deduped[key]
+            replace = False
+            if result.get('success') and not current.get('success'):
+                replace = True
+            elif bool(result.get('success')) == bool(current.get('success')):
+                if float(result.get('response_time') or 999999) < float(current.get('response_time') or 999999):
+                    replace = True
+
+            if replace:
+                deduped[key] = result
+
+        return [deduped[key] for key in order]
 
     def _try_backend_thread(self, tmdb_id, backend, media_type, season, episode, result_queue):
         result = {
@@ -607,19 +645,51 @@ class VidNestResolver:
         return False
 
     def _build_json_response(self, results):
-        successful = [r for r in results if r['success']]
-        failed = [r for r in results if not r['success']]
+        # Final safety net: collapse duplicate backend paths before counts and
+        # response serialization. This protects callers even if results come
+        # from a custom/legacy resolver path rather than _try_all_backends().
+        unique_results = []
+        by_path = {}
+        order = []
+
+        for result in results:
+            key = str(result.get('path') or result.get('backend') or '').strip().lower()
+            if not key:
+                key = f"__row_{len(order)}"
+
+            if key not in by_path:
+                by_path[key] = result
+                order.append(key)
+                continue
+
+            current = by_path[key]
+            replace = False
+            if result.get('success') and not current.get('success'):
+                replace = True
+            elif bool(result.get('success')) == bool(current.get('success')):
+                if float(result.get('response_time') or 999999) < float(current.get('response_time') or 999999):
+                    replace = True
+
+            if replace:
+                by_path[key] = result
+
+        unique_results = [by_path[key] for key in order]
+
+        successful = [r for r in unique_results if r['success']]
+        failed = [r for r in unique_results if not r['success']]
 
         response = {
             'status': 'success' if successful else 'error',
-            'total_backends': len(results),
+            'total_backends': len(unique_results),
             'successful_backends': len(successful),
             'failed_backends': len(failed),
             'results': [],
             'playable_urls': []
         }
 
-        for result in results:
+        seen_playable_urls = set()
+
+        for result in unique_results:
             result_data = {
                 'backend': result['backend'],
                 'path': result['path'],
@@ -633,6 +703,28 @@ class VidNestResolver:
                 result_data['url'] = result['url']
                 result_data['headers'] = headers
 
+                # De-duplicate subtitle tracks inside an individual backend
+                # result by normalized URL (falling back to language/label).
+                subtitles = result.get('subtitles') or []
+                if subtitles:
+                    unique_subtitles = []
+                    seen_subtitles = set()
+                    for sub in subtitles:
+                        if not isinstance(sub, dict):
+                            continue
+                        key = str(sub.get('url') or '').strip()
+                        if not key:
+                            key = (
+                                str(sub.get('lang') or sub.get('label') or '').strip().lower()
+                                + '|'
+                                + str(sub.get('kind') or '').strip().lower()
+                            )
+                        if not key or key in seen_subtitles:
+                            continue
+                        seen_subtitles.add(key)
+                        unique_subtitles.append(sub)
+                    subtitles = unique_subtitles
+
                 playable_entry = {
                     'backend': result['backend'],
                     'server': result['backend'],
@@ -640,15 +732,9 @@ class VidNestResolver:
                     'headers': headers
                 }
 
-                # subtitles: anime (hianime) gets these from its own decrypted
-                # payload (tracks[]); movie/tv backends get these from the
-                # separate vdrk subtitle CDN (_fetch_vdrk_subtitles), keyed by
-                # TMDB id rather than coming from the backend's own JSON.
-                # intro/outro remain anime (hianime) only — movie/tv backends
-                # don't return these fields.
-                if result.get('subtitles'):
-                    result_data['subtitles'] = result['subtitles']
-                    playable_entry['subtitles'] = result['subtitles']
+                if subtitles:
+                    result_data['subtitles'] = subtitles
+                    playable_entry['subtitles'] = subtitles
                 if result.get('intro'):
                     result_data['intro'] = result['intro']
                     playable_entry['intro'] = result['intro']
@@ -656,7 +742,13 @@ class VidNestResolver:
                     result_data['outro'] = result['outro']
                     playable_entry['outro'] = result['outro']
 
-                response['playable_urls'].append(playable_entry)
+                # Same final stream URL from multiple aliases/backends should
+                # only appear once in playable_urls. The first canonical
+                # backend wins.
+                stream_key = str(result['url']).strip()
+                if stream_key and stream_key not in seen_playable_urls:
+                    seen_playable_urls.add(stream_key)
+                    response['playable_urls'].append(playable_entry)
 
             response['results'].append(result_data)
 
