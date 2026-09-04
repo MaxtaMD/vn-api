@@ -33,6 +33,8 @@ BACKENDS = [
     {'name': 'NextgenCloudFabric', 'path': 'nextgencloudfabric'},
     {'name': 'Vidxyz', 'path': 'vidxyz'},
     {'name': 'Vidzee', 'path': 'vidzee'},
+    {'name': 'Buzz', 'path': 'buzz'},
+    {'name': 'Rogflix', 'path': 'rogflix'},
 ]
 
 USER_AGENTS = {
